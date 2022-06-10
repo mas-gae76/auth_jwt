@@ -1,21 +1,23 @@
-from flask import make_response, render_template, Flask, request, redirect, url_for, flash, get_flashed_messages
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import current_user, login_user, logout_user, LoginManager
+# Flask modules
+from flask import (jsonify, make_response, render_template, request,
+                   redirect, url_for, flash, get_flashed_messages)
+from flask_jwt_extended import (create_access_token, create_refresh_token, 
+                                set_access_cookies, set_refresh_cookies,
+                                jwt_required, unset_jwt_cookies, get_jwt_identity)
+from flask_jwt_extended.exceptions import NoAuthorizationError
+from flask_login import login_user, logout_user
 from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime
+# Custom modules
+from config import app, login_manager, jwt
 from forms import AuthForm
 from models import *
-import os, jwt
-from datetime import datetime, timedelta
-from decorators import jwt_required
 
 
-app = Flask(__name__)
-app.secret_key = '\xb7\xdc\x96y[P\x90g\xdb\xaf\xf9\xcc)z{\x98'
-app.debug = True
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///test.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = True
-db = SQLAlchemy(app)
-login_manager = LoginManager(app)
+@jwt.expired_token_loader
+def my_expired_token_callback(jwt_header, jwt_payload):
+    flash('Время жизни токена истекло!')
+    return redirect('login', 401)
 
 
 @login_manager.user_loader
@@ -28,36 +30,74 @@ def signup():
     form = AuthForm()
     if request.method == 'POST' and form.validate_on_submit():
         data = form.data
-        user  = Users.query.filter_by(username=data['username']).first()
+        user = Users.query.filter_by(username=data['username']).first()
         if user:
             flash(f'Пользователь с ником \'{user.username}\' уже существует!')
             return redirect('signup')
-        
-        new_user = Users(username=data['username'], password=generate_password_hash(data['password']))
-        new_user.token = jwt.encode(
-                                    {
-                                        'username': new_user.username, 
-                                        'exp': datetime.utcnow() + timedelta(minutes=2)
-                                    }, 
-                                    app.secret_key, 
-                                    algorithm='HS256'
-                                   )
+
+        new_user = Users(
+            username=data['username'], password=generate_password_hash(data['password']))
+        new_user.token = create_access_token(identity=new_user.username)
         db.session.add(new_user)
         db.session.commit()
         login_user(new_user)
-        return set_cookie(new_user.token)
+
+        refresh_token = create_refresh_token(identity=new_user.username)
+        response = make_response(redirect('/'))
+        set_access_cookies(response, new_user.token)
+        set_refresh_cookies(response, refresh_token)
+        return response
     return render_template('signup.html', form=form)
 
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    form = AuthForm()
+    if request.method == 'POST' and form.validate_on_submit():
+        data = form.data
+        user = Users.query.filter_by(username=data['username']).first()
+        if not check_password_hash(user.password, data['password']):
+            flash(f'Введён неверный пароль!')
+            return redirect('login')
+        login_user(user)
+        user.token = create_access_token(identity=user.username)
+        db.session.commit()
+        refresh_token = create_refresh_token(identity=user.username)
+        response = make_response(redirect('/'))
+        set_access_cookies(response, user.token)
+        set_refresh_cookies(response, refresh_token)
+        return response
+    return render_template('login.html', form=form)
+
+
+@app.route('/logout')
+def logout():
+    response = make_response(redirect('login'))
+    logout_user()
+    unset_jwt_cookies(response)
+    return response
+
+
 @app.route('/', methods=['GET'])
-@jwt_required
+@jwt_required(fresh=False)
 def main():
     return render_template('index.html')
 
 
-def set_cookie(token: str):
+
+@app.route('/refresh', methods=['POST'])
+@jwt_required(refresh=True)
+def refresh():
+    identity = get_jwt_identity()
+    print(identity)
     response = make_response(redirect('/'))
-    response.set_cookie('token', value=f'{token}', max_age=600, secure=True, samesite='strict')
+    if datetime.now() > datetime.fromtimestamp(int(identity['exp'])):
+        user = Users.query.filter_by(username=identity['sub']) 
+        user.token = create_access_token(identity=identity['sub'])
+        db.session.commit()
+        refresh_token = create_refresh_token(identity=identity['sub'])
+        set_access_cookies(response, user.token)
+        set_refresh_cookies(response, refresh_token)
     return response
 
 
